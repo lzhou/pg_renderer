@@ -1,124 +1,73 @@
+create or replace function render_template(
+  p_tmplt text,
+  p_ctx jsonb,
+  p_null_str text default '')
+  returns text language plpgsql as $$
+declare
+  l_fn_name text := 'tpl_' || md5(p_tmplt);
+  l_fn_decl text := 'DECLARE res text := ''''; ';
+  l_fn_body text := 'BEGIN ';
+  l_ret text;
+  l_cursor int := 1;
+  l_beg_tag int;
+  l_end_tag int;
+  l_chunk text;
+  l_tag_content text;
+  ctx jsonb := p_ctx;
+begin
+  if to_regproc('pg_temp.' || l_fn_name) is null then
+    loop
+    l_beg_tag := strpos(substr(p_tmplt, l_cursor), '<%');
+    if l_beg_tag = 0 then
+      l_chunk := substr(p_tmplt, l_cursor);
+      if length(l_chunk) > 0 then
+        l_fn_body := l_fn_body || ' res := concat(res, '
+          || quote_literal(l_chunk) || ');';
+      end if;
+      exit;
+    end if;
 
-CREATE OR REPLACE FUNCTION render_template(template_text text, ctx jsonb)
-RETURNS text
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    tpl_hash text := md5(template_text);
-    func_name text := 'tpl_' || tpl_hash;
+    l_beg_tag := l_cursor + l_beg_tag - 1;
+    if l_beg_tag > l_cursor then
+      l_chunk := substr(p_tmplt, l_cursor, l_beg_tag - l_cursor);
+      l_fn_body := l_fn_body || ' res := concat(res, '
+        || quote_literal(l_chunk) || ');';
+    end if;
 
-    fn_decl text := 'DECLARE res text := ''''; ';
-    fn_body text := 'BEGIN ';
-    final_output text;
+    l_end_tag := strpos(substr(p_tmplt, l_beg_tag), '%>');
+    if l_end_tag = 0 then
+      raise exception 'Unclosed tag at %', l_beg_tag;
+    end if;
+    l_end_tag := l_beg_tag + l_end_tag - 1;
 
-    cursor int := 1;
-    start_tag int;
-    end_tag int;
-    chunk text;
-    clean_chunk text; -- Holds the normalized logic
-    tag_content text;
+    l_tag_content := substr(p_tmplt, l_beg_tag, l_end_tag - l_beg_tag + 2);
 
-    loop_var text;
-    declared_vars text[] := ARRAY[]::text[];
-BEGIN
-    IF to_regproc('pg_temp.' || func_name) IS NULL THEN
+    if left(l_tag_content, 3) = '<%=' then
+      l_fn_body := l_fn_body
+        || ' res := concat(res, COALESCE(('
+        || substring(l_tag_content from 4 for length(l_tag_content)-5)
+        || ')::text, p_null_str));';
 
-        LOOP
-            -- 1. Find Start "<%"
-            start_tag := strpos(substr(template_text, cursor), '<%');
+    else
+      l_fn_body := l_fn_body
+        || substring(l_tag_content from 3 for length(l_tag_content)-4);
+    end if;
 
-            IF start_tag = 0 THEN
-                chunk := substr(template_text, cursor);
-                IF length(chunk) > 0 THEN
-                    fn_body := fn_body || 'res := res || ' || quote_literal(chunk) || ';';
-                END IF;
-                EXIT;
-            END IF;
+    l_cursor := l_end_tag + 2;
+    end loop;
 
-            start_tag := cursor + start_tag - 1;
+    l_fn_body := l_fn_body || 'RETURN res; END;';
 
-            -- 2. Flush Text Before Tag
-            IF start_tag > cursor THEN
-                chunk := substr(template_text, cursor, start_tag - cursor);
-                fn_body := fn_body || 'res := res || ' || quote_literal(chunk) || ';';
-            END IF;
+    execute 'CREATE OR REPLACE FUNCTION pg_temp.'
+      || quote_ident(l_fn_name) || '(ctx jsonb, p_null_str text) '
+      || 'RETURNS text LANGUAGE plpgsql AS '
+      || quote_literal(l_fn_decl || l_fn_body);
+  end if;
 
-            -- 3. Find End "%>"
-            end_tag := strpos(substr(template_text, start_tag), '%>');
-            IF end_tag = 0 THEN RAISE EXCEPTION 'Unclosed tag at %', start_tag; END IF;
-            end_tag := start_tag + end_tag - 1;
+  execute 'SELECT pg_temp.' || quote_ident(l_fn_name) || '($1, $2)'
+    into l_ret
+    using ctx, p_null_str;
 
-            tag_content := substr(template_text, start_tag, end_tag - start_tag + 2);
-
-            -- === INTELLIGENT TRANSPILE ===
-
-            -- Case A: Output (<%=)
-            IF left(tag_content, 3) = '<%=' THEN
-                fn_body := fn_body
-                    || 'res := res || coalesce(('
-                    || substring(tag_content from 4 for length(tag_content)-5)
-                    || ')::text, '''');';
-
-            -- Case B: Logic (<%)
-            ELSE
-                chunk := substring(tag_content from 3 for length(tag_content)-4);
-
-                -- STEP 1: Normalize Input (Remove trailing ; and space)
-                -- This ensures <% END LOOP; %> and <% END LOOP %> are treated identically
-                clean_chunk := regexp_replace(chunk, '[\s;]+$', '');
-                clean_chunk := trim(clean_chunk);
-
-                -- STEP 2: Variable Auto-Discovery
-                loop_var := (regexp_match(clean_chunk, 'FOR\s+([a-zA-Z0-9_]+)\s+IN', 'i'))[1];
-                IF loop_var IS NOT NULL THEN
-                    IF NOT (declared_vars @> ARRAY[loop_var]) THEN
-                        fn_decl := fn_decl || loop_var || ' record; ';
-                        declared_vars := declared_vars || loop_var;
-                    END IF;
-
-                    -- Smart Wrapper (Only if not already raw SQL)
-                    IF clean_chunk !~* 'SELECT' AND clean_chunk !~* 'jsonb_array_elements' THEN
-                        IF clean_chunk ~* 'FOR\s+(\w+)\s+IN\s+(.+?)\s+LOOP' THEN
-                            clean_chunk := regexp_replace(
-                                clean_chunk,
-                                'FOR\s+(\w+)\s+IN\s+(.+?)\s+LOOP',
-                                'FOR \1 IN SELECT * FROM jsonb_array_elements(\2) LOOP',
-                                'i'
-                            );
-                        END IF;
-                    END IF;
-                END IF;
-
-                -- STEP 3: Smart Semicolon Injection
-                -- Logic: Block STARTERS (THEN, LOOP, DO, BEGIN) get space.
-                --        Block ENDERS (END LOOP) and statements get semicolon.
-                --        CRITICAL: We must distinguish "LOOP" from "END LOOP"
-
-                IF clean_chunk ~* 'THEN$'
-                   OR clean_chunk ~* 'ELSE$'
-                   OR clean_chunk ~* 'DO$'
-                   OR clean_chunk ~* 'BEGIN$'
-                   -- Matches "LOOP" but NOT "END LOOP"
-                   OR (clean_chunk ~* 'LOOP$' AND clean_chunk !~* 'END\s+LOOP$') THEN
-
-                     fn_body := fn_body || clean_chunk || ' ';
-                ELSE
-                     fn_body := fn_body || clean_chunk || ';';
-                END IF;
-            END IF;
-
-            cursor := end_tag + 2;
-        END LOOP;
-
-        fn_body := fn_body || 'RETURN res; END;';
-
-        EXECUTE 'CREATE OR REPLACE FUNCTION pg_temp.' || quote_ident(func_name) || '(ctx jsonb) '
-             || 'RETURNS text LANGUAGE plpgsql AS '
-             || quote_literal(fn_decl || fn_body);
-    END IF;
-
-    EXECUTE 'SELECT pg_temp.' || quote_ident(func_name) || '($1)' INTO final_output USING ctx;
-
-    RETURN final_output;
-END;
+  return l_ret;
+end;
 $$;
